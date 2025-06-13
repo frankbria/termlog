@@ -1,0 +1,445 @@
+#!/bin/bash
+
+# Terminal logging script that monitors stdin/stdout and logs to markdown files
+# Usage: termlog [start|stop|status] [options]
+#        termlog command [args]
+#        command | termlog [options]
+
+# Default values
+THREAD_ID=""
+LOG_DIR="$HOME/.termlog"
+TIMESTAMP_FORMAT="+%Y-%m-%d %H:%M:%S"
+SESSION_DIR="$LOG_DIR/.sessions"
+TEMP_DIR="$LOG_DIR/.temp"
+
+# Function to display help
+show_help() {
+    cat << EOF
+Usage: termlog [COMMAND] [OPTIONS] [-- COMMAND [ARGS...]]
+
+A terminal logging utility that captures stdin/stdout to markdown files.
+
+COMMANDS:
+    start               Start logging all terminal output
+    stop                Stop logging terminal output
+    status              Check if logging is active
+    [command]           Execute and log a single command
+
+OPTIONS:
+    -t, --thread ID     Specify thread/channel ID for logging
+    -d, --dir PATH      Log directory (default: ~/.termlog)
+    -h, --help          Show this help message
+
+SESSION MODE EXAMPLES:
+    # Start logging everything in current terminal
+    termlog start
+    termlog start --thread 1
+    
+    # Run your commands normally - everything is logged
+    npm run dev
+    python app.py
+    
+    # Stop logging
+    termlog stop
+
+COMMAND MODE EXAMPLES:
+    # Log output from a single command
+    termlog npm run dev
+    
+    # Log with thread ID
+    termlog --thread 1 npm run dev
+    
+    # Pipe output through termlog
+    npm run dev 2>&1 | termlog --thread 1
+
+MULTI-TERMINAL EXAMPLES:
+    # Terminal 1
+    termlog start --thread 1
+    npm run dev
+    
+    # Terminal 2 (same project)
+    termlog start --thread 2
+    npm test
+    
+    # Different project
+    termlog start --thread server1
+    uvicorn main:app --reload
+
+EOF
+}
+
+# Parse command line arguments
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        start|stop|status)
+            COMMAND="$1"
+            shift
+            ;;
+        -t|--thread)
+            THREAD_ID="$2"
+            shift 2
+            ;;
+        -d|--dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Create necessary directories
+mkdir -p "$LOG_DIR" "$SESSION_DIR" "$TEMP_DIR"
+
+# Determine log file name and session file
+if [[ -z "$THREAD_ID" ]]; then
+    LOG_FILE="$LOG_DIR/console.md"
+    SESSION_FILE="$SESSION_DIR/default.session"
+    PREFIX=""
+else
+    # Extract the base thread name (before any numbers)
+    BASE_THREAD=$(echo "$THREAD_ID" | sed 's/[0-9]*$//')
+    if [[ -z "$BASE_THREAD" ]] || [[ "$BASE_THREAD" =~ ^[0-9]+$ ]]; then
+        # If thread ID is purely numeric or empty after removing numbers
+        LOG_FILE="$LOG_DIR/console.md"
+        SESSION_FILE="$SESSION_DIR/default-$THREAD_ID.session"
+        PREFIX="${THREAD_ID}>"
+    else
+        # If thread ID has a text component, use it as filename
+        LOG_FILE="$LOG_DIR/console-${BASE_THREAD}.md"
+        SESSION_FILE="$SESSION_DIR/${BASE_THREAD}.session"
+        # Extract the numeric suffix if any
+        THREAD_NUM=$(echo "$THREAD_ID" | grep -o '[0-9]*$')
+        if [[ -n "$THREAD_NUM" ]]; then
+            PREFIX="${THREAD_NUM}>"
+        else
+            PREFIX="${THREAD_ID}>"
+        fi
+    fi
+fi
+
+# Initialize log file with header if it doesn't exist
+init_log_file() {
+    if [[ ! -f "$LOG_FILE" ]]; then
+        cat > "$LOG_FILE" << EOF
+# Console Log
+
+Started: $(date "$TIMESTAMP_FORMAT")
+
+---
+
+EOF
+    fi
+}
+
+# Function to process and log script output
+process_script_output() {
+    local input_file="$1"
+    local temp_file="$TEMP_DIR/processed_$$.txt"
+    
+    # Process the script output to add timestamps and prefixes
+    awk -v prefix="$PREFIX" -v logfile="$LOG_FILE" '
+    BEGIN {
+        in_block = 0
+        buffer = ""
+    }
+    {
+        # Remove script control characters
+        gsub(/\r/, "")
+        gsub(/\x1b\[[0-9;]*[mGKH]/, "")
+        gsub(/\x1b\[?[0-9;]*[a-zA-Z]/, "")
+        gsub(/\x08/, "")
+        
+        # Skip empty lines
+        if (length($0) == 0) next
+        
+        # Add line to buffer
+        if (prefix != "") {
+            buffer = buffer prefix " " $0 "\n"
+        } else {
+            buffer = buffer $0 "\n"
+        }
+        
+        # Every 10 lines or so, flush to file
+        if (++in_block >= 10) {
+            if (buffer != "") {
+                timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                print "```" >> logfile
+                print "[" timestamp "] SESSION" >> logfile
+                printf "%s", buffer >> logfile
+                print "```" >> logfile
+                print "" >> logfile
+                fflush(logfile)
+                buffer = ""
+                in_block = 0
+            }
+        }
+    }
+    END {
+        # Flush remaining buffer
+        if (buffer != "") {
+            timestamp = strftime("%Y-%m-%d %H:%M:%S")
+            print "```" >> logfile
+            print "[" timestamp "] SESSION" >> logfile
+            printf "%s", buffer >> logfile
+            print "```" >> logfile
+            print "" >> logfile
+            fflush(logfile)
+        }
+    }
+    ' "$input_file"
+}
+
+# Start session logging
+start_session() {
+    if [[ -f "$SESSION_FILE" ]]; then
+        echo "Logging is already active for this thread. Stop it first with: termlog stop"
+        exit 1
+    fi
+    
+    init_log_file
+    
+    # Create a unique typescript file for this session
+    TYPESCRIPT_FILE="$TEMP_DIR/typescript_$$_$(date +%s).txt"
+    
+    # Add session start marker to log
+    {
+        echo ""
+        echo "## 🟢 Session Started"
+        echo "**Thread:** ${THREAD_ID:-default}"
+        echo "**Time:** $(date "$TIMESTAMP_FORMAT")"
+        echo ""
+        echo "---"
+        echo ""
+    } >> "$LOG_FILE"
+    
+    # Save session info
+    cat > "$SESSION_FILE" << EOF
+PID=$$
+TYPESCRIPT_FILE=$TYPESCRIPT_FILE
+LOG_FILE=$LOG_FILE
+THREAD_ID=$THREAD_ID
+PREFIX=$PREFIX
+EOF
+    
+    echo "📝 Started logging session${THREAD_ID:+ for thread: $THREAD_ID}"
+    echo "📁 Log file: $LOG_FILE"
+    echo "🛑 Stop with: termlog stop${THREAD_ID:+ --thread $THREAD_ID}"
+    echo ""
+    
+    # Start script command to capture everything
+    # Create a processing script that will run in background
+    PROCESSOR_SCRIPT="$TEMP_DIR/processor_$$.sh"
+    cat > "$PROCESSOR_SCRIPT" << 'EOFSCRIPT'
+#!/bin/bash
+source "$SESSION_FILE"
+tail -f "$TYPESCRIPT_FILE" 2>/dev/null | while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+        timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+        {
+            echo '```'
+            echo "[$timestamp] SESSION"
+            if [[ -n "$PREFIX" ]]; then
+                echo "$PREFIX $line"
+            else
+                echo "$line"
+            fi
+            echo '```'
+            echo ""
+        } >> "$LOG_FILE"
+    fi
+done
+EOFSCRIPT
+    chmod +x "$PROCESSOR_SCRIPT"
+    
+    # Start the processor in background
+    nohup bash "$PROCESSOR_SCRIPT" > /dev/null 2>&1 &
+    PROCESSOR_PID=$!
+    echo "PROCESSOR_PID=$PROCESSOR_PID" >> "$SESSION_FILE"
+    
+    # Use script command to capture terminal session
+    export TERMLOG_ACTIVE=1
+    export TERMLOG_SESSION_FILE="$SESSION_FILE"
+    script -f -q "$TYPESCRIPT_FILE"
+    
+    # When script exits, clean up
+    stop_session
+}
+
+# Stop session logging
+stop_session() {
+    if [[ ! -f "$SESSION_FILE" ]]; then
+        if [[ -n "$TERMLOG_ACTIVE" ]]; then
+            # We're inside the script session, just exit
+            exit 0
+        fi
+        echo "No active logging session found${THREAD_ID:+ for thread: $THREAD_ID}"
+        exit 1
+    fi
+    
+    # Load session info
+    source "$SESSION_FILE"
+    
+    # Kill the processor
+    if [[ -n "$PROCESSOR_PID" ]]; then
+        kill $PROCESSOR_PID 2>/dev/null
+    fi
+    
+    # Add session end marker to log
+    {
+        echo ""
+        echo "## 🔴 Session Ended"
+        echo "**Time:** $(date "$TIMESTAMP_FORMAT")"
+        echo ""
+        echo "---"
+        echo ""
+    } >> "$LOG_FILE"
+    
+    # Clean up
+    rm -f "$SESSION_FILE" "$TYPESCRIPT_FILE" "$PROCESSOR_SCRIPT"
+    
+    if [[ -z "$TERMLOG_ACTIVE" ]]; then
+        echo "✅ Stopped logging session${THREAD_ID:+ for thread: $THREAD_ID}"
+    fi
+}
+
+# Check session status
+check_status() {
+    if [[ -f "$SESSION_FILE" ]]; then
+        source "$SESSION_FILE"
+        echo "📝 Logging is ACTIVE${THREAD_ID:+ for thread: $THREAD_ID}"
+        echo "📁 Log file: $LOG_FILE"
+        echo "🛑 Stop with: termlog stop${THREAD_ID:+ --thread $THREAD_ID}"
+    else
+        echo "⭕ No active logging session${THREAD_ID:+ for thread: $THREAD_ID}"
+        echo "▶️  Start with: termlog start${THREAD_ID:+ --thread $THREAD_ID}"
+    fi
+}
+
+# Function to log output with proper formatting (for command mode)
+log_output() {
+    local type="$1"
+    local prefix="$2"
+    local line
+    
+    while IFS= read -r line; do
+        local timestamp=$(date "$TIMESTAMP_FORMAT")
+        local formatted_line
+        
+        # Format the line with prefix and type
+        if [[ -n "$prefix" ]]; then
+            formatted_line="${prefix} ${line}"
+        else
+            formatted_line="${line}"
+        fi
+        
+        # Write to log file
+        {
+            echo "\`\`\`"
+            echo "[${timestamp}] ${type}"
+            echo "${formatted_line}"
+            echo "\`\`\`"
+            echo ""
+        } >> "$LOG_FILE"
+        
+        # Also output to terminal
+        echo "${line}"
+    done
+}
+
+# Main execution
+case "$COMMAND" in
+    start)
+        start_session
+        ;;
+    stop)
+        stop_session
+        ;;
+    status)
+        check_status
+        ;;
+    *)
+        # Original command mode behavior
+        init_log_file
+        
+        if [[ $# -eq 0 ]]; then
+            # No command provided, read from stdin
+            log_output "STDOUT" "$PREFIX"
+        else
+            # Command provided, execute and capture output
+            echo "" >> "$LOG_FILE"
+            echo "## Command: $*" >> "$LOG_FILE"
+            echo "" >> "$LOG_FILE"
+            
+            # Create named pipes for stdout and stderr
+            FIFO_OUT=$(mktemp -u)
+            FIFO_ERR=$(mktemp -u)
+            mkfifo "$FIFO_OUT" "$FIFO_ERR"
+            
+            # Cleanup function
+            cleanup() {
+                rm -f "$FIFO_OUT" "$FIFO_ERR"
+                exit
+            }
+            trap cleanup EXIT INT TERM
+            
+            # Start logging processes in background
+            log_output "STDOUT" "$PREFIX" < "$FIFO_OUT" &
+            PID_OUT=$!
+            
+            (while IFS= read -r line; do
+                local timestamp=$(date "$TIMESTAMP_FORMAT")
+                local formatted_line
+                
+                if [[ -n "$PREFIX" ]]; then
+                    formatted_line="${PREFIX} ${line}"
+                else
+                    formatted_line="${line}"
+                fi
+                
+                {
+                    echo "\`\`\`error"
+                    echo "[${timestamp}] STDERR"
+                    echo "${formatted_line}"
+                    echo "\`\`\`"
+                    echo ""
+                } >> "$LOG_FILE"
+                
+                echo "${line}" >&2
+            done) < "$FIFO_ERR" &
+            PID_ERR=$!
+            
+            # Execute the command with output redirected to pipes
+            "$@" > "$FIFO_OUT" 2> "$FIFO_ERR"
+            EXIT_CODE=$?
+            
+            # Wait for logging processes to finish
+            wait $PID_OUT $PID_ERR
+            
+            # Log exit code
+            {
+                echo "### Exit Code: $EXIT_CODE"
+                echo ""
+                echo "---"
+                echo ""
+            } >> "$LOG_FILE"
+            
+            exit $EXIT_CODE
+        fi
+        ;;
+esac
